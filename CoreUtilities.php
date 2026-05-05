@@ -2188,15 +2188,11 @@ if (stripos($rSource, '|cenc=') !== false) {
 	// normalizacja URL dopiero po usunięciu |cenc=
 	$rStreamSource = self::parseStreamURL($sourceUrl);
 
-// FIX: rozwiąż redirect dla MPD (cdn-s -> lb2) zanim poleci ffprobe/ffmpeg
-if (stripos($rStreamSource, '.mpd') !== false) {
-    $rStreamSource = self::resolveRedirectUrl($rStreamSource);
-}
 if (stripos($rStreamSource, '.mpd') !== false) {
     $rProbesize = max((int)$rProbesize, 5000000);
     $rAnalyseDuration = max((int)$rAnalyseDuration, 5000000);
 }
-// NIE doklejamy nic do URL — klucz pójdzie jako opcja ffmpeg/ffprobe -cenc_decryption_key
+// NIE doklejamy nic do URL — klucz pójdzie jako opcja ffmpeg -decryption_key
 // (zostawiamy $rStreamSource jako czyste .../live.mpd)
 
 
@@ -2245,47 +2241,37 @@ $rProcessed = false;
 $rProtocol = strtolower(substr($rStreamSource, 0, strpos($rStreamSource, '://')));
 $rProbeOptions = implode(' ', self::getArguments($rProbeArguments, $rProtocol, 'fetch'));
 $rFetchOptions = implode(' ', self::getArguments($rStream['stream_arguments'], $rProtocol, 'fetch'));
-// ===== FIX: panel "probe" dla DASH/MPD + CENC =====
-// ffprobe często wywala się na CENC, mimo że ffmpeg z kluczem działa.
-// Dlatego robimy krótki test ffmpeg (-t 2 -f null -). Jak OK -> uznajemy probe za udany.
 $isDash = (stripos($rStreamSource, '.mpd') !== false);
 $hasCenc = !empty($cencKeys);
 
+// DASH+CENC: pomiń ffprobe (nie umie zdekryptować), dodaj klucz i ustaw domyślne parametry.
+// Format klucza: obsługujemy KID=KEY, KID:KEY lub sam KEY — do ffmpeg trafia tylko KEY.
 if ($isDash && $hasCenc) {
-    // dołącz klucze CENC do FFmpeg fetch options
     foreach ($cencKeys as $pair) {
         $pair = preg_replace('/[^a-fA-F0-9:=]/', '', $pair);
-        $pair = str_replace(':', '=', $pair);
-        if (strpos($rFetchOptions, '-cenc_decryption_key ' . $pair) === false) {
-    $rFetchOptions .= ' -cenc_decryption_key ' . $pair;
+        if ($pair === '') continue;
+        // Wyciągnij tylko KEY (bez KID) — opcja -decryption_key oczekuje samego 32-znakowego klucza
+        if (strpos($pair, '=') !== false) {
+            $keyOnly = explode('=', $pair, 2)[1];
+        } elseif (strpos($pair, ':') !== false) {
+            $keyOnly = explode(':', $pair, 2)[1];
+        } else {
+            $keyOnly = $pair;
+        }
+        if ($keyOnly === '') continue;
+        if (strpos($rFetchOptions, '-decryption_key ' . $keyOnly) === false) {
+            $rFetchOptions .= ' -decryption_key ' . $keyOnly;
         }
     }
-
-    $testCmd =
-        self::$rFFMPEG_CPU .
-        ' -hide_banner -loglevel error -nostdin ' .
-        $rFetchOptions .
-        ' -t 2 -i ' . escapeshellarg($rStreamSource) .
-        ' -c copy -f null - >/dev/null 2>&1; echo $?';
-
-    $rc = intval(trim(shell_exec($testCmd)));
-
-    if ($rc === 0) {
-        // Minimalny wynik "probe" żeby pipeline ruszył
-        $rFFProbeOutput = array(
-            'codecs' => array(
-                'video' => array('codec_name' => 'h264', 'codec_type' => 'video', 'height' => 1080),
-                'audio' => array('codec_name' => 'aac', 'codec_type' => 'audio'),
-            ),
-            'container' => 'dash'
-        );
-
-        // Ustaw żeby dalej kod się nie bawił w ffprobe
-        // (wyjdź z pętli sources tak jak robisz po udanym ffprobe)
-        break;
-    }
+    $rFFProbeOutput = array(
+        'codecs' => array(
+            'video' => array('codec_name' => 'h264', 'codec_type' => 'video', 'height' => 1080),
+            'audio' => array('codec_name' => 'aac', 'codec_type' => 'audio'),
+        ),
+        'container' => 'dash'
+    );
+    break;
 }
-// ===== END FIX =====
 // HTTP Proxy z panelu (stream_options[2]) -> dla FFmpeg i FFprobe
 $panelProxyRaw = $rStream['stream_info']['stream_options'][2]['value'] ?? '';
 $panelProxy = self::normalizeHttpProxy($panelProxyRaw);
@@ -2299,19 +2285,6 @@ if ($panelProxy !== '') {
     if (stripos($rProbeOptions, '-http_proxy') === false) {
         $rProbeOptions .= ' -http_proxy ' . escapeshellarg($panelProxy);
     }
-}
-// --- CENC: ONLY for ffmpeg (not for ffprobe scan) ---
-if (!empty($cencKeys) && stripos($rStreamSource, '.mpd') !== false) {
-    foreach ($cencKeys as $pair) {
-        $pair = preg_replace('/[^a-fA-F0-9:=]/', '', $pair);
-        if ($pair === '') continue;
-
-        $pair = str_replace(':', '=', $pair);
-
-        // zawsze -cenc_decryption_key
-        $rFetchOptions .= ' -cenc_decryption_key ' . $pair;
-    }
-	
 }
 // --- A) DASH/MPD stability: timeouts + persistent HTTP ---
 if (stripos($rStreamSource, '.mpd') !== false) {
@@ -2482,7 +2455,7 @@ if (
 					}
 	// --- B) DASH/MPD timestamp stabilization (reduces 1s freezes every few minutes) ---
 if (stripos($rStreamSource, '.mpd') !== false) {
-    $rGenPTS = '-fflags +genpts+igndts -use_wallclock_as_timestamps 1 -avoid_negative_ts make_zero';
+    $rGenPTS = '-fflags +genpts -avoid_negative_ts make_zero';
 }
 					$container = (isset($rFFProbeOutput) && is_array($rFFProbeOutput)) ? ($rFFProbeOutput['container'] ?? null) : null;
 					if (empty($rStream['server_info']['parent_id']) && (($rStream['stream_info']['read_native'] == 1) ||   ($container && stristr($container, 'hls') && self::$rSettings['read_native_hls']) || empty($rProtocol) || ($container && stristr($container, 'mp4')) ||				($container && stristr($container, 'matroska')))) {
