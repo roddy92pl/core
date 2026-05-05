@@ -2252,26 +2252,37 @@ $isDash = (stripos($rStreamSource, '.mpd') !== false);
 $hasCenc = !empty($cencKeys);
 
 if ($isDash && $hasCenc) {
-    // dołącz klucze CENC do FFmpeg fetch options
+    // Build test options with CENC keys using a separate variable — do NOT modify $rFetchOptions here.
+    // CENC will be added to $rFetchOptions exactly once in the dedicated block below.
+    $testFetch = $rFetchOptions;
     foreach ($cencKeys as $pair) {
         $pair = preg_replace('/[^a-fA-F0-9:=]/', '', $pair);
         $pair = str_replace(':', '=', $pair);
-        if (strpos($rFetchOptions, '-cenc_decryption_key ' . $pair) === false) {
-    $rFetchOptions .= ' -cenc_decryption_key ' . $pair;
+        if ($pair === '' || strpos($pair, '=') === false) continue; // require KID=KEY format
+        if (strpos($testFetch, '-cenc_decryption_key ' . $pair) === false) {
+            $testFetch .= ' -cenc_decryption_key ' . $pair;
         }
     }
 
     $testCmd =
         self::$rFFMPEG_CPU .
         ' -hide_banner -loglevel error -nostdin ' .
-        $rFetchOptions .
+        $testFetch .
         ' -t 2 -i ' . escapeshellarg($rStreamSource) .
         ' -c copy -f null - >/dev/null 2>&1; echo $?';
 
     $rc = intval(trim(shell_exec($testCmd)));
 
     if ($rc === 0) {
-        // Minimalny wynik "probe" żeby pipeline ruszył
+        // Test passed — add CENC to actual fetch options (single place) and skip ffprobe
+        foreach ($cencKeys as $pair) {
+            $pair = preg_replace('/[^a-fA-F0-9:=]/', '', $pair);
+            $pair = str_replace(':', '=', $pair);
+            if ($pair === '' || strpos($pair, '=') === false) continue;
+            if (strpos($rFetchOptions, '-cenc_decryption_key ' . $pair) === false) {
+                $rFetchOptions .= ' -cenc_decryption_key ' . $pair;
+            }
+        }
         $rFFProbeOutput = array(
             'codecs' => array(
                 'video' => array('codec_name' => 'h264', 'codec_type' => 'video', 'height' => 1080),
@@ -2279,9 +2290,6 @@ if ($isDash && $hasCenc) {
             ),
             'container' => 'dash'
         );
-
-        // Ustaw żeby dalej kod się nie bawił w ffprobe
-        // (wyjdź z pętli sources tak jak robisz po udanym ffprobe)
         break;
     }
 }
@@ -2300,21 +2308,19 @@ if ($panelProxy !== '') {
         $rProbeOptions .= ' -http_proxy ' . escapeshellarg($panelProxy);
     }
 }
-// --- CENC: ONLY for ffmpeg (not for ffprobe scan) ---
+// --- CENC: ONLY for ffmpeg (not for ffprobe scan) — single place, with deduplication ---
 if (!empty($cencKeys) && stripos($rStreamSource, '.mpd') !== false) {
     foreach ($cencKeys as $pair) {
         $pair = preg_replace('/[^a-fA-F0-9:=]/', '', $pair);
-        if ($pair === '') continue;
-
         $pair = str_replace(':', '=', $pair);
-
-        // zawsze -cenc_decryption_key
-        $rFetchOptions .= ' -cenc_decryption_key ' . $pair;
+        if ($pair === '' || strpos($pair, '=') === false) continue; // require KID=KEY format
+        if (strpos($rFetchOptions, '-cenc_decryption_key ' . $pair) === false) {
+            $rFetchOptions .= ' -cenc_decryption_key ' . $pair;
+        }
     }
-	
 }
-// --- A) DASH/MPD stability: timeouts + persistent HTTP ---
-if (stripos($rStreamSource, '.mpd') !== false) {
+// --- A) DASH/MPD stability: timeouts + persistent HTTP (http/https only) ---
+if (stripos($rStreamSource, '.mpd') !== false && ($rProtocol === 'http' || $rProtocol === 'https')) {
     // nie doklejaj drugi raz jeśli już jest
     if (stripos($rFetchOptions, '-rw_timeout') === false) {
         $rFetchOptions .= ' -rw_timeout 15000000';
