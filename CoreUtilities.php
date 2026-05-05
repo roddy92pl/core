@@ -2308,17 +2308,10 @@ if ($panelProxy !== '') {
         $rProbeOptions .= ' -http_proxy ' . escapeshellarg($panelProxy);
     }
 }
-// --- CENC: ONLY for ffmpeg (not for ffprobe scan) — single place, with deduplication ---
-if (!empty($cencKeys) && stripos($rStreamSource, '.mpd') !== false) {
-    foreach ($cencKeys as $pair) {
-        $pair = preg_replace('/[^a-fA-F0-9:=]/', '', $pair);
-        $pair = str_replace(':', '=', $pair);
-        if ($pair === '' || strpos($pair, '=') === false) continue; // require KID=KEY format
-        if (strpos($rFetchOptions, '-cenc_decryption_key ' . $pair) === false) {
-            $rFetchOptions .= ' -cenc_decryption_key ' . $pair;
-        }
-    }
-}
+// NOTE: -cenc_decryption_key is only added to $rFetchOptions inside the test-success branch
+// above (if ($rc === 0)). If the test fails for any reason — including the option not being
+// supported by this FFmpeg build — the option is intentionally omitted from the stream command,
+// restoring the behaviour that existed before CENC handling was introduced.
 // --- A) DASH/MPD stability: timeouts + persistent HTTP (http/https only) ---
 if (stripos($rStreamSource, '.mpd') !== false && ($rProtocol === 'http' || $rProtocol === 'https')) {
     // nie doklejaj drugi raz jeśli już jest
