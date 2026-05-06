@@ -2241,23 +2241,8 @@ $rProcessed = false;
 $rProtocol = strtolower(substr($rStreamSource, 0, strpos($rStreamSource, '://')));
 $rProbeOptions = implode(' ', self::getArguments($rProbeArguments, $rProtocol, 'fetch'));
 $rFetchOptions = implode(' ', self::getArguments($rStream['stream_arguments'], $rProtocol, 'fetch'));
-$isDash = (stripos($rStreamSource, '.mpd') !== false);
+$isDash = (stripos($rStreamSource, '.mpd') !== false) || (stripos($rStreamSource, '.livx') !== false);
 $hasCenc = !empty($cencKeys);
-
-// DASH/MPD quality and track selection: generate a filtered local MPD so FFmpeg
-// always uses the chosen video quality (<=720p) and audio language (PL preferred).
-// Works for both plain DASH and DASH+CENC (CENC keys still apply to segments).
-if ($isDash) {
-    $mpdPanelProxy = self::normalizeHttpProxy($rStream['stream_info']['stream_options'][2]['value'] ?? '');
-    $rStreamSource = self::prepareDashSource(
-        $rStreamSource,
-        $rStream['stream_arguments'],
-        $mpdPanelProxy,
-        $rStreamID
-    );
-    // Re-evaluate: local .mpd file path still ends in .mpd
-    $isDash = (stripos($rStreamSource, '.mpd') !== false);
-}
 
 // DASH+CENC: pomiń ffprobe (nie umie zdekryptować), dodaj klucz i ustaw domyślne parametry.
 // Gdy KID+KEY: -cenc_decryption_keys KID=KEY (przyjmuje oba — plural).
@@ -2295,8 +2280,8 @@ if ($isDash && $hasCenc) {
     if (stripos($rFetchOptions, '-rw_timeout') === false) {
         $rFetchOptions .= ' -rw_timeout 15000000';
     }
-    if (stripos($rFetchOptions, '-http_persistent') === false) {
-     //   $rFetchOptions .= ' -http_persistent 1';
+    if (stripos($rFetchOptions, '-http_seekable 0') === false) {
+      $rFetchOptions .= ' -http_seekable 0';
     }
     if (stripos($rFetchOptions, '-multiple_requests') === false) {
         $rFetchOptions .= ' -multiple_requests 1';
@@ -2804,390 +2789,6 @@ public static function normalizeHttpProxy($proxyRaw) {
     return $proxyRaw;
 }
 
-/**
- * Fetch MPD manifest content via cURL using the stream's headers, cookies and proxy.
- * Returns null on any network or HTTP error (safe fallback).
- *
- * @param string $url             MPD URL
- * @param array  $streamArguments Stream arguments array from DB
- * @param string $panelProxy      Normalised HTTP proxy URL or empty string
- * @return string|null            MPD XML content or null on failure
- */
-private static function fetchMpdContent(string $url, array $streamArguments, string $panelProxy): ?string
-{
-    $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL            => $url,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS      => 5,
-        CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_TIMEOUT        => 15,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_SSL_VERIFYHOST => false,
-    ]);
-
-    $curlHeaders = [];
-    $cookieStr   = '';
-    foreach ($streamArguments as $arg) {
-        if (!isset($arg['argument_key'], $arg['value'])) {
-            continue;
-        }
-        if ($arg['argument_key'] === 'headers') {
-            foreach (preg_split('/\r\n|\r|\n/', (string)$arg['value']) as $line) {
-                $line = trim($line);
-                if ($line !== '') {
-                    $curlHeaders[] = $line;
-                }
-            }
-        } elseif ($arg['argument_key'] === 'cookie') {
-            $cookieStr = trim((string)$arg['value']);
-        }
-    }
-
-    if (!empty($curlHeaders)) {
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $curlHeaders);
-    }
-    if ($cookieStr !== '') {
-        curl_setopt($ch, CURLOPT_COOKIE, $cookieStr);
-    }
-    if ($panelProxy !== '') {
-        curl_setopt($ch, CURLOPT_PROXY, $panelProxy);
-    }
-
-    $result   = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($result === false || $httpCode < 200 || $httpCode >= 300) {
-        return null;
-    }
-    return (string)$result;
-}
-
-/**
- * Parse MPD XML and select the best video AdaptationSet (highest height <=maxHeight,
- * fallback to smallest) and the preferred audio AdaptationSet (PL language preferred).
- *
- * Uses DOMDocument / DOMXPath with external entity loading disabled (no XXE).
- * Handles DASH namespace urn:mpeg:dash:schema:mpd:2011 and namespace-less MPDs.
- *
- * @param string $mpdXml     Raw MPD XML string
- * @param int    $maxHeight  Maximum video height to allow (default 720)
- * @param array  $audioLangs Preferred audio language codes, case-insensitive
- * @return array|null ['videoIdx'=>int, 'audioIdx'=>int, 'dom'=>DOMDocument] or null on failure
- */
-private static function selectDashTracks(
-    string $mpdXml,
-    int    $maxHeight  = 720,
-    array  $audioLangs = ['pl', 'pol', 'pl-pl', 'polish']
-): ?array {
-    // Disable external entity loading (XXE prevention). In PHP 8+ this is the default.
-    if (PHP_VERSION_ID < 80000) {
-        // @phpstan-ignore-next-line
-        libxml_disable_entity_loader(true);
-    }
-
-    $prevErrors = libxml_use_internal_errors(true);
-    $dom = new \DOMDocument();
-    $dom->preserveWhiteSpace = false;
-    if (!$dom->loadXML($mpdXml)) {
-        libxml_use_internal_errors($prevErrors);
-        return null;
-    }
-    libxml_use_internal_errors($prevErrors);
-
-    $xpath = new \DOMXPath($dom);
-    $xpath->registerNamespace('mpd', 'urn:mpeg:dash:schema:mpd:2011');
-
-    // Query AdaptationSet elements — try namespaced first, fallback to local-name
-    $adaptationSets = $xpath->query('//mpd:AdaptationSet');
-    if ($adaptationSets === false || $adaptationSets->length === 0) {
-        $adaptationSets = $xpath->query('//*[local-name()="AdaptationSet"]');
-    }
-    if ($adaptationSets === false || $adaptationSets->length === 0) {
-        return null;
-    }
-
-    $videoSets       = [];
-    $audioSets       = [];
-    $audioLangsLower = array_map('strtolower', $audioLangs);
-
-    foreach ($adaptationSets as $idx => $as) {
-        /** @var \DOMElement $as */
-        $ct       = strtolower($as->getAttribute('contentType'));
-        $mimeType = strtolower($as->getAttribute('mimeType'));
-        $lang     = strtolower($as->getAttribute('lang'));
-
-        $isVideo = ($ct === 'video') || (strpos($mimeType, 'video') !== false);
-        $isAudio = ($ct === 'audio') || (strpos($mimeType, 'audio') !== false);
-
-        // Fallback: infer type from Representation codec/mimeType children
-        if (!$isVideo && !$isAudio) {
-            $repNodes = $xpath->query('.//*[local-name()="Representation"]', $as);
-            if ($repNodes !== false) {
-                foreach ($repNodes as $rep) {
-                    /** @var \DOMElement $rep */
-                    $repMime = strtolower($rep->getAttribute('mimeType'));
-                    $codec   = strtolower($rep->getAttribute('codecs'));
-                    if (strpos($repMime, 'video') !== false || strpos($codec, 'avc') !== false ||
-                        strpos($codec, 'hev') !== false || strpos($codec, 'vp9') !== false) {
-                        $isVideo = true;
-                    } elseif (strpos($repMime, 'audio') !== false || strpos($codec, 'mp4a') !== false ||
-                               strpos($codec, 'ac-3') !== false  || strpos($codec, 'opus') !== false) {
-                        $isAudio = true;
-                    }
-                    if ($isVideo || $isAudio) {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if ($isVideo) {
-            $asHeight = intval($as->getAttribute('height'));
-            $maxH     = $asHeight;
-            $maxBw    = 0;
-            $repNodes = $xpath->query('.//*[local-name()="Representation"]', $as);
-            if ($repNodes !== false) {
-                foreach ($repNodes as $rep) {
-                    /** @var \DOMElement $rep */
-                    $rh = intval($rep->getAttribute('height'));
-                    $rb = intval($rep->getAttribute('bandwidth'));
-                    if ($rh > $maxH) {
-                        $maxH = $rh;
-                    }
-                    if ($rb > $maxBw) {
-                        $maxBw = $rb;
-                    }
-                }
-            }
-            $videoSets[] = ['idx' => $idx, 'node' => $as, 'maxHeight' => $maxH, 'bandwidth' => $maxBw];
-        } elseif ($isAudio) {
-            $audioSets[] = ['idx' => $idx, 'node' => $as, 'lang' => $lang];
-        }
-    }
-
-    if (empty($videoSets)) {
-        return null;
-    }
-
-    // Select video: highest height <= maxHeight; fallback to smallest available
-    $eligible = array_values(array_filter(
-        $videoSets,
-        static fn($v) => $v['maxHeight'] > 0 && $v['maxHeight'] <= $maxHeight
-    ));
-    if (!empty($eligible)) {
-        usort($eligible, static fn($a, $b) =>
-            $b['maxHeight'] <=> $a['maxHeight'] ?: $b['bandwidth'] <=> $a['bandwidth']
-        );
-        $selectedVideo = $eligible[0];
-    } else {
-        // Fallback: pick smallest height so the stream still works
-        $fallback = $videoSets;
-        usort($fallback, static fn($a, $b) => $a['maxHeight'] <=> $b['maxHeight']);
-        $selectedVideo = $fallback[0];
-    }
-
-    // Select audio: prefer PL language, fallback to first available
-    $selectedAudio = null;
-    foreach ($audioSets as $aSet) {
-        if (in_array($aSet['lang'], $audioLangsLower, true)) {
-            $selectedAudio = $aSet;
-            break;
-        }
-    }
-    if ($selectedAudio === null && !empty($audioSets)) {
-        $selectedAudio = $audioSets[0];
-    }
-
-    error_log(
-        '[XC_VM] DASH selection: video id=' . $selectedVideo['node']->getAttribute('id') .
-        ' height=' . $selectedVideo['maxHeight'] . ' bw=' . $selectedVideo['bandwidth'] .
-        ' | audio id=' . ($selectedAudio ? $selectedAudio['node']->getAttribute('id') : 'none') .
-        ' lang=' . ($selectedAudio ? $selectedAudio['lang'] : 'none')
-    );
-
-    return [
-        'videoIdx' => $selectedVideo['idx'],
-        'audioIdx' => ($selectedAudio !== null ? $selectedAudio['idx'] : -1),
-        'dom'      => $dom,
-    ];
-}
-
-/**
- * Build a filtered MPD XML string from a parsed DOMDocument, keeping only the
- * selected video and audio AdaptationSets.  Injects a <BaseURL> so relative
- * segment references resolve correctly when FFmpeg opens the local file.
- *
- * @param \DOMDocument $dom      Parsed MPD document (will be cloned, original unchanged)
- * @param int          $videoIdx Index of selected video AdaptationSet
- * @param int          $audioIdx Index of selected audio AdaptationSet (-1 = none)
- * @param string       $mpdUrl   Original MPD URL (used to compute BaseURL)
- * @return string|null           Filtered MPD XML or null on failure
- */
-private static function buildFilteredMpd(\DOMDocument $dom, int $videoIdx, int $audioIdx, string $mpdUrl): ?string
-{
-    $filtered = clone $dom;
-    $xpath    = new \DOMXPath($filtered);
-    $xpath->registerNamespace('mpd', 'urn:mpeg:dash:schema:mpd:2011');
-
-    $mpdEl = $filtered->documentElement;
-    if ($mpdEl === null) {
-        return null;
-    }
-
-    // Inject BaseURL at the MPD root level so relative segment URLs resolve when
-    // FFmpeg reads the local filtered file instead of the original remote MPD.
-    $existingBase = $xpath->query('/*[local-name()="MPD"]/*[local-name()="BaseURL"]');
-    if ($existingBase !== false && $existingBase->length === 0) {
-        // Compute directory URL of the MPD (strip filename and query string)
-        $baseUrl    = preg_replace('#[^/]*(\?.*)?$#', '', $mpdUrl);
-        $detectedNs = $mpdEl->namespaceURI;
-        if ($detectedNs !== null && $detectedNs !== '') {
-            $baseUrlEl = $filtered->createElementNS($detectedNs, 'BaseURL');
-        } else {
-            $baseUrlEl = $filtered->createElement('BaseURL');
-        }
-        $baseUrlEl->appendChild($filtered->createTextNode($baseUrl));
-        $mpdEl->insertBefore($baseUrlEl, $mpdEl->firstChild);
-    }
-
-    // Collect all AdaptationSet nodes and remove those not selected
-    $adaptationSets = $xpath->query('//*[local-name()="AdaptationSet"]');
-    if ($adaptationSets === false) {
-        return null;
-    }
-    $toRemove = [];
-    foreach ($adaptationSets as $idx => $as) {
-        if ($idx !== $videoIdx && $idx !== $audioIdx) {
-            $toRemove[] = $as;
-        }
-    }
-    foreach ($toRemove as $node) {
-        if ($node->parentNode !== null) {
-            $node->parentNode->removeChild($node);
-        }
-    }
-
-    // Within the remaining video AdaptationSet, keep only the best Representation <=720p
-    $remainingAs = $xpath->query('//*[local-name()="AdaptationSet"]');
-    if ($remainingAs !== false) {
-        foreach ($remainingAs as $as) {
-            /** @var \DOMElement $as */
-            $ct       = strtolower($as->getAttribute('contentType'));
-            $mimeType = strtolower($as->getAttribute('mimeType'));
-            $isVideo  = ($ct === 'video') || (strpos($mimeType, 'video') !== false);
-            if (!$isVideo) {
-                $repNodes = $xpath->query('.//*[local-name()="Representation"]', $as);
-                if ($repNodes !== false) {
-                    foreach ($repNodes as $rep) {
-                        /** @var \DOMElement $rep */
-                        $repMime = strtolower($rep->getAttribute('mimeType'));
-                        $codec   = strtolower($rep->getAttribute('codecs'));
-                        if (strpos($repMime, 'video') !== false || strpos($codec, 'avc') !== false ||
-                            strpos($codec, 'hev') !== false) {
-                            $isVideo = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!$isVideo) {
-                continue;
-            }
-
-            $repNodes = $xpath->query('.//*[local-name()="Representation"]', $as);
-            if ($repNodes === false || $repNodes->length <= 1) {
-                continue;
-            }
-
-            // Find the best Representation <= 720p to keep
-            $allReps = [];
-            foreach ($repNodes as $rep) {
-                $allReps[] = $rep;
-            }
-            $best   = null;
-            $bestH  = 0;
-            $bestBw = 0;
-            foreach ($allReps as $rep) {
-                /** @var \DOMElement $rep */
-                $rh = intval($rep->getAttribute('height'));
-                $rb = intval($rep->getAttribute('bandwidth'));
-                if ($rh > 0 && $rh <= 720 && ($rh > $bestH || ($rh === $bestH && $rb > $bestBw))) {
-                    $best   = $rep;
-                    $bestH  = $rh;
-                    $bestBw = $rb;
-                }
-            }
-            if ($best !== null) {
-                foreach ($allReps as $rep) {
-                    if ($rep !== $best && $rep->parentNode !== null) {
-                        $rep->parentNode->removeChild($rep);
-                    }
-                }
-            }
-        }
-    }
-
-    $filtered->formatOutput = false;
-    $xml = $filtered->saveXML();
-    return ($xml !== false) ? $xml : null;
-}
-
-/**
- * Fetch, parse, filter and save a DASH MPD for stable quality/track selection.
- * Returns path to the local filtered MPD file, or the original URL on any failure.
- *
- * The filtered MPD contains:
- *   - one video AdaptationSet with the best available quality <=720p (fallback: smallest)
- *   - one audio AdaptationSet preferring Polish language (fallback: first available)
- *
- * @param string $mpdUrl          Original MPD URL
- * @param array  $streamArguments Stream arguments from DB
- * @param string $panelProxy      Normalised proxy URL or empty string
- * @param int    $streamId        Stream ID (used for temp file naming)
- * @return string                 Local file path or original URL
- */
-private static function prepareDashSource(
-    string $mpdUrl,
-    array  $streamArguments,
-    string $panelProxy,
-    int    $streamId
-): string {
-    $mpdXml = self::fetchMpdContent($mpdUrl, $streamArguments, $panelProxy);
-    if ($mpdXml === null) {
-        error_log('[XC_VM] DASH MPD fetch failed for stream ' . $streamId . ' — using original URL');
-        return $mpdUrl;
-    }
-
-    $selection = self::selectDashTracks($mpdXml);
-    if ($selection === null) {
-        error_log('[XC_VM] DASH MPD parse/select failed for stream ' . $streamId . ' — using original URL');
-        return $mpdUrl;
-    }
-
-    $filteredXml = self::buildFilteredMpd(
-        $selection['dom'],
-        $selection['videoIdx'],
-        $selection['audioIdx'],
-        $mpdUrl
-    );
-    if ($filteredXml === null) {
-        error_log('[XC_VM] DASH filtered MPD build failed for stream ' . $streamId . ' — using original URL');
-        return $mpdUrl;
-    }
-
-    $tmpPath = sys_get_temp_dir() . '/xcvm_mpd_' . intval($streamId) . '.mpd';
-    if (file_put_contents($tmpPath, $filteredXml) === false) {
-        error_log('[XC_VM] DASH filtered MPD write failed for stream ' . $streamId . ' — using original URL');
-        return $mpdUrl;
-    }
-
-    error_log('[XC_VM] DASH using filtered MPD at ' . $tmpPath . ' for stream ' . $streamId);
-    return $tmpPath;
-}
-
 public static function resolveRedirectUrl($url, $timeout = 3) {
     $ch = curl_init($url);
     curl_setopt($ch, CURLOPT_NOBODY, true);
@@ -3235,22 +2836,30 @@ public static function getArguments($rArguments, $rProtocol, $rType) {
                 $rArgument['value'] = self::fixCookie($rArgument['value']);
             }
 
-            if ($rArgument['argument_key'] == 'headers') {
-                // FFmpeg/FFprobe wymagają CRLF między nagłówkami + końcowego CRLF.
-                // Panel czasem zapisuje nagłówki w 1 linii -> rozbijamy.
-                $v = trim((string)$rArgument['value']);
-                $v = str_replace(["\r\n", "\r"], "\n", $v);
+if ($rArgument['argument_key'] == 'headers') {
+    $v = trim((string)$rArgument['value']);
 
-                // sklej "Header:\nvalue" -> "Header: value"
-                $v = preg_replace("/:\s*\n\s*/", ": ", $v);
+    // normalizacja końców linii
+    $v = str_replace(["\r\n", "\r"], "\n", $v);
 
-                // rozbij " ... Referer:" -> nowa linia przed następnym headerem
-                $v = preg_replace("/\s+([A-Za-z0-9\-]+)\s*:/", "\n$1:", $v);
+    // jeśli ktoś podał w jednej linii (CSV) → rozbij po przecinku
+    if (strpos($v, "\n") === false) {
+        $headers = array_map('trim', explode(',', $v));
+    } else {
+        // jeśli już są linie → użyj ich
+        $headers = array_map('trim', explode("\n", $v));
+    }
 
-                $v = str_replace("\n", "\r\n", $v);
-                $v = rtrim($v, "\r\n") . "\r\n\r\n";
-                $rArgument['value'] = $v;
-            }
+    // usuń puste / śmieci
+    $headers = array_filter($headers, function($h) {
+        return $h !== '' && strpos($h, ':') !== false;
+    });
+
+    // sklej do formatu FFmpeg (CRLF!)
+    $v = implode("\r\n", $headers) . "\r\n";
+
+    $rArgument['value'] = $v;
+}
 
             // follow_redirects jako bool/text -> wymuszamy 1
             if ($rArgument['argument_key'] == 'follow_redirects') {
