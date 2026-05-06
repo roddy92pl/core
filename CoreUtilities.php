@@ -2263,6 +2263,22 @@ if ($isDash && $hasCenc) {
             $rFetchOptions .= ' -decryption_key ' . $keyOnly;
         }
     }
+    // HTTP proxy (panel stream_options[2])
+    $panelProxyRaw = $rStream['stream_info']['stream_options'][2]['value'] ?? '';
+    $panelProxy = self::normalizeHttpProxy($panelProxyRaw);
+    if ($panelProxy !== '' && stripos($rFetchOptions, '-http_proxy') === false) {
+        $rFetchOptions .= ' -http_proxy ' . escapeshellarg($panelProxy);
+    }
+    // DASH stability options (needed for CENC streams too)
+    if (stripos($rFetchOptions, '-rw_timeout') === false) {
+        $rFetchOptions .= ' -rw_timeout 15000000';
+    }
+    if (stripos($rFetchOptions, '-http_persistent') === false) {
+        $rFetchOptions .= ' -http_persistent 1';
+    }
+    if (stripos($rFetchOptions, '-multiple_requests') === false) {
+        $rFetchOptions .= ' -multiple_requests 1';
+    }
     $rFFProbeOutput = array(
         'codecs' => array(
             'video' => array('codec_name' => 'h264', 'codec_type' => 'video', 'height' => 1080),
