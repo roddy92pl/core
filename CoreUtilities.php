@@ -2245,22 +2245,29 @@ $isDash = (stripos($rStreamSource, '.mpd') !== false);
 $hasCenc = !empty($cencKeys);
 
 // DASH+CENC: pomiń ffprobe (nie umie zdekryptować), dodaj klucz i ustaw domyślne parametry.
-// Format klucza: obsługujemy KID=KEY, KID:KEY lub sam KEY — do ffmpeg trafia tylko KEY.
+// Gdy KID+KEY: -cenc_decryption_keys KID=KEY (przyjmuje oba — plural).
+// Gdy sam KEY:  -cenc_decryption_key KEY       (singular).
 if ($isDash && $hasCenc) {
     foreach ($cencKeys as $pair) {
         $pair = preg_replace('/[^a-fA-F0-9:=]/', '', $pair);
         if ($pair === '') continue;
-        // Wyciągnij tylko KEY (bez KID) — opcja -decryption_key oczekuje samego 32-znakowego klucza
         if (strpos($pair, '=') !== false) {
-            $keyOnly = explode('=', $pair, 2)[1];
+            // Normalize KID=KEY
+            $normalized = $pair;
+            if (strpos($rFetchOptions, '-cenc_decryption_keys ' . $normalized) === false) {
+                $rFetchOptions .= ' -cenc_decryption_keys ' . escapeshellarg($normalized);
+            }
         } elseif (strpos($pair, ':') !== false) {
-            $keyOnly = explode(':', $pair, 2)[1];
+            // Normalize KID:KEY → KID=KEY
+            $normalized = str_replace(':', '=', $pair);
+            if (strpos($rFetchOptions, '-cenc_decryption_keys ' . $normalized) === false) {
+                $rFetchOptions .= ' -cenc_decryption_keys ' . escapeshellarg($normalized);
+            }
         } else {
-            $keyOnly = $pair;
-        }
-        if ($keyOnly === '') continue;
-        if (strpos($rFetchOptions, '-decryption_key ' . $keyOnly) === false) {
-            $rFetchOptions .= ' -decryption_key ' . $keyOnly;
+            // Bare key only — singular option
+            if (strpos($rFetchOptions, '-cenc_decryption_key ' . $pair) === false) {
+                $rFetchOptions .= ' -cenc_decryption_key ' . escapeshellarg($pair);
+            }
         }
     }
     // HTTP proxy (panel stream_options[2])
@@ -2279,6 +2286,8 @@ if ($isDash && $hasCenc) {
     if (stripos($rFetchOptions, '-multiple_requests') === false) {
         $rFetchOptions .= ' -multiple_requests 1';
     }
+    // Live DASH: read at native frame rate
+    $rReadNative = '-re';
     $rFFProbeOutput = array(
         'codecs' => array(
             'video' => array('codec_name' => 'h264', 'codec_type' => 'video', 'height' => 1080),
