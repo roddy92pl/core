@@ -2483,7 +2483,7 @@ if (stripos($rStreamSource, '.mpd') !== false) {
     $rGenPTS = '-fflags +genpts -avoid_negative_ts make_zero';
 }
 					$container = (isset($rFFProbeOutput) && is_array($rFFProbeOutput)) ? ($rFFProbeOutput['container'] ?? null) : null;
-					if (empty($rStream['server_info']['parent_id']) && (($rStream['stream_info']['read_native'] == 1) ||   ($container && stristr($container, 'hls') && self::$rSettings['read_native_hls']) || empty($rProtocol) || ($container && stristr($container, 'mp4')) ||				($container && stristr($container, 'matroska')))) {
+					if (empty($rStream['server_info']['parent_id']) && (($rStream['stream_info']['read_native'] == 1) ||   ($container && stristr($container, 'hls') && self::$rSettings['read_native_hls']) || empty($rProtocol) || ($container && stristr($container, 'mp4')) ||				($container && stristr($container, 'matroska')) || ($container && stristr($container, 'dash')))) {
 						$rReadNative = '-re';
 					} else {
 						$rReadNative = '';
