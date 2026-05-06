@@ -2244,6 +2244,15 @@ $rFetchOptions = implode(' ', self::getArguments($rStream['stream_arguments'], $
 $isDash = (stripos($rStreamSource, '.mpd') !== false) || (stripos($rStreamSource, '.livx') !== false);
 $hasCenc = !empty($cencKeys);
 
+// DASH demuxer manages its own HTTP connections and retries internally.
+// -reconnect_streamed causes ffmpeg to reconnect when the finite manifest file reaches
+// EOF, which breaks manifest parsing and produces "Unable to read manifest" errors.
+if ($isDash) {
+    $rStripReconnectStreamed = '/\s*-reconnect_streamed\s+\S+/';
+    $rFetchOptions = preg_replace($rStripReconnectStreamed, '', $rFetchOptions);
+    $rProbeOptions = preg_replace($rStripReconnectStreamed, '', $rProbeOptions);
+}
+
 // DASH+CENC: pomiń ffprobe (nie umie zdekryptować), dodaj klucz i ustaw domyślne parametry.
 // Gdy KID+KEY: -cenc_decryption_keys KID=KEY (przyjmuje oba — plural).
 // Gdy sam KEY:  -cenc_decryption_key KEY       (singular).
