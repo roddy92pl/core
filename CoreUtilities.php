@@ -2244,23 +2244,20 @@ $rFetchOptions = implode(' ', self::getArguments($rStream['stream_arguments'], $
 $isDash = (stripos($rStreamSource, '.mpd') !== false);
 $hasCenc = !empty($cencKeys);
 
-// DASH+CENC: pomiń ffprobe (nie umie zdekryptować), dodaj klucz i ustaw domyślne parametry.
-// Format klucza: obsługujemy KID=KEY, KID:KEY lub sam KEY — do ffmpeg trafia tylko KEY.
+// DASH+CENC: pomiń ffprobe (nie umie zdekryptować), dodaj klucze i ustaw domyślne parametry.
+// Format klucza: akceptujemy KID:KEY lub KID=KEY — normalizujemy do KID=KEY dla ffmpeg.
 if ($isDash && $hasCenc) {
     foreach ($cencKeys as $pair) {
         $pair = preg_replace('/[^a-fA-F0-9:=]/', '', $pair);
         if ($pair === '') continue;
-        // Wyciągnij tylko KEY (bez KID) — opcja -decryption_key oczekuje samego 32-znakowego klucza
-        if (strpos($pair, '=') !== false) {
-            $keyOnly = explode('=', $pair, 2)[1];
-        } elseif (strpos($pair, ':') !== false) {
-            $keyOnly = explode(':', $pair, 2)[1];
-        } else {
-            $keyOnly = $pair;
-        }
-        if ($keyOnly === '') continue;
-        if (strpos($rFetchOptions, '-decryption_key ' . $keyOnly) === false) {
-            $rFetchOptions .= ' -decryption_key ' . $keyOnly;
+        // Normalize KID:KEY → KID=KEY (accept both separators)
+        $normalized = str_replace(':', '=', $pair);
+        if (strpos($normalized, '=') === false) continue;
+        list($kid, $key) = array_pad(explode('=', $normalized, 2), 2, '');
+        if ($kid === '' || $key === '') continue;
+        if (strpos($rFetchOptions, '-cenc_decryption_key ' . $normalized) === false) {
+            $rFetchOptions .= ' -cenc_decryption_key ' . $normalized;
+            error_log('[XC_VM] Stream ' . $rStreamID . ': CENC key added for KID=' . substr($kid, 0, 8) . '...');
         }
     }
     $rFFProbeOutput = array(
@@ -2463,7 +2460,10 @@ if (stripos($rStreamSource, '.mpd') !== false) {
 					} else {
 						$rReadNative = '';
 					}
-
+// MPD/DASH is adaptive-bitrate — paced reads (-re) cause buffer stalls; never use it.
+if ($isDash) {
+    $rReadNative = '';
+}
 
 					if (!$rStream['server_info']['parent_id'] && $rStream['stream_info']['enable_transcode'] == 1 && $rStream['stream_info']['type_key'] != 'created_live') {
 						if ($rStream['stream_info']['transcode_profile_id'] == -1) {
