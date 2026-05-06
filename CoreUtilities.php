@@ -2813,7 +2813,7 @@ public static function normalizeHttpProxy($proxyRaw) {
  * @param string $panelProxy      Normalised HTTP proxy URL or empty string
  * @return string|null            MPD XML content or null on failure
  */
-private static function fetchMpdContent(string $url, array $streamArguments, string $panelProxy, int &$httpCode = 0): ?string
+private static function fetchMpdContent(string $url, array $streamArguments, string $panelProxy, int &$httpCode): ?string
 {
     $ch = curl_init();
     curl_setopt_array($ch, [
@@ -2882,12 +2882,7 @@ private static function selectDashTracks(
     int    $maxHeight  = 720,
     array  $audioLangs = ['pl', 'pol', 'pl-pl', 'polish']
 ): ?array {
-    // Disable external entity loading (XXE prevention). In PHP 8+ this is the default.
-    if (PHP_VERSION_ID < 80000) {
-        // @phpstan-ignore-next-line
-        libxml_disable_entity_loader(true);
-    }
-
+    // External entity loading is disabled by default in PHP 8+ DOMDocument (no XXE risk).
     $prevErrors = libxml_use_internal_errors(true);
     $dom = new \DOMDocument();
     $dom->preserveWhiteSpace = false;
@@ -3046,8 +3041,8 @@ private static function buildFilteredMpd(\DOMDocument $dom, int $videoIdx, int $
     // FFmpeg reads the local filtered file instead of the original remote MPD.
     $existingBase = $xpath->query('/*[local-name()="MPD"]/*[local-name()="BaseURL"]');
     if ($existingBase !== false && $existingBase->length === 0) {
-        // Compute directory URL of the MPD (strip filename and query string)
-        $mpdBaseDir = preg_replace('#[^/]*(\?.*)?$#', '', $mpdUrl);
+        // Strip filename (and any trailing query string) to get the base directory URL
+        $mpdBaseDir = preg_replace('#[^/?]*(\?[^/]*)?$#', '', $mpdUrl);
         $detectedNs = $mpdEl->namespaceURI;
         if ($detectedNs !== null && $detectedNs !== '') {
             $baseUrlEl = $filtered->createElementNS($detectedNs, 'BaseURL');
