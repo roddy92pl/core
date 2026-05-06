@@ -2813,7 +2813,7 @@ public static function normalizeHttpProxy($proxyRaw) {
  * @param string $panelProxy      Normalised HTTP proxy URL or empty string
  * @return string|null            MPD XML content or null on failure
  */
-private static function fetchMpdContent(string $url, array $streamArguments, string $panelProxy): ?string
+private static function fetchMpdContent(string $url, array $streamArguments, string $panelProxy, int &$httpCode = 0): ?string
 {
     $ch = curl_init();
     curl_setopt_array($ch, [
@@ -2856,7 +2856,7 @@ private static function fetchMpdContent(string $url, array $streamArguments, str
     }
 
     $result   = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
     if ($result === false || $httpCode < 200 || $httpCode >= 300) {
@@ -2892,7 +2892,12 @@ private static function selectDashTracks(
     $dom = new \DOMDocument();
     $dom->preserveWhiteSpace = false;
     if (!$dom->loadXML($mpdXml)) {
+        $xmlErrors = libxml_get_errors();
+        libxml_clear_errors();
         libxml_use_internal_errors($prevErrors);
+        if (!empty($xmlErrors)) {
+            error_log('[XC_VM] DASH MPD XML parse error: ' . trim($xmlErrors[0]->message));
+        }
         return null;
     }
     libxml_use_internal_errors($prevErrors);
@@ -3042,14 +3047,14 @@ private static function buildFilteredMpd(\DOMDocument $dom, int $videoIdx, int $
     $existingBase = $xpath->query('/*[local-name()="MPD"]/*[local-name()="BaseURL"]');
     if ($existingBase !== false && $existingBase->length === 0) {
         // Compute directory URL of the MPD (strip filename and query string)
-        $baseUrl    = preg_replace('#[^/]*(\?.*)?$#', '', $mpdUrl);
+        $mpdBaseDir = preg_replace('#[^/]*(\?.*)?$#', '', $mpdUrl);
         $detectedNs = $mpdEl->namespaceURI;
         if ($detectedNs !== null && $detectedNs !== '') {
             $baseUrlEl = $filtered->createElementNS($detectedNs, 'BaseURL');
         } else {
             $baseUrlEl = $filtered->createElement('BaseURL');
         }
-        $baseUrlEl->appendChild($filtered->createTextNode($baseUrl));
+        $baseUrlEl->appendChild($filtered->createTextNode($mpdBaseDir));
         $mpdEl->insertBefore($baseUrlEl, $mpdEl->firstChild);
     }
 
@@ -3155,9 +3160,10 @@ private static function prepareDashSource(
     string $panelProxy,
     int    $streamId
 ): string {
-    $mpdXml = self::fetchMpdContent($mpdUrl, $streamArguments, $panelProxy);
+    $fetchHttpCode = 0;
+    $mpdXml = self::fetchMpdContent($mpdUrl, $streamArguments, $panelProxy, $fetchHttpCode);
     if ($mpdXml === null) {
-        error_log('[XC_VM] DASH MPD fetch failed for stream ' . $streamId . ' — using original URL');
+        error_log('[XC_VM] DASH MPD fetch failed for stream ' . $streamId . ' (HTTP ' . $fetchHttpCode . ') — using original URL');
         return $mpdUrl;
     }
 
@@ -3178,9 +3184,10 @@ private static function prepareDashSource(
         return $mpdUrl;
     }
 
+    // File named by stream ID; only one active process per stream ID is expected.
     $tmpPath = sys_get_temp_dir() . '/xcvm_mpd_' . intval($streamId) . '.mpd';
     if (file_put_contents($tmpPath, $filteredXml) === false) {
-        error_log('[XC_VM] DASH filtered MPD write failed for stream ' . $streamId . ' — using original URL');
+        error_log('[XC_VM] DASH filtered MPD write failed for stream ' . $streamId . ' (path: ' . $tmpPath . ') — using original URL');
         return $mpdUrl;
     }
 
